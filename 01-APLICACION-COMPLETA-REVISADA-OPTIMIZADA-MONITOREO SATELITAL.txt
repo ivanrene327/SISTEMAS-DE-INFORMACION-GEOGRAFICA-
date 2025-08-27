@@ -2,10 +2,8 @@
 
 AUTOR: ING. IVAN RENE CONDORI GARCIA
 inf: ivanrene327gmail.com
-  APP INTEGRADA (arranque liviano)
-  - No carga mapas base ni capas al inicio (sin SATELLITE, sin mosaicos)
+  APP INTEGRADA
   - Monitoreo Satelital (Sentinel-2, ΔNDVI, ΔNBR) solo al presionar "Cargar"
-  - Dos mapas linkeados (swipe)
   - Badges (arriba-derecha) y Leyenda (abajo-izquierda) solo cuando hay capas
   - Herramienta de Medición incrustada en el sidebar (siempre disponible)
 
@@ -462,3 +460,4 @@ renderApp({
   zoom: 12,
   loaded: false           // <-- arranque liviano
 });
+

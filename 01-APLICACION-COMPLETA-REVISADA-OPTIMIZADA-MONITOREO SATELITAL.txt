@@ -1,0 +1,464 @@
+/**** =========================================================
+
+AUTOR: ING. IVAN RENE CONDORI GARCIA
+inf: ivanrene327gmail.com
+  APP INTEGRADA (arranque liviano)
+  - No carga mapas base ni capas al inicio (sin SATELLITE, sin mosaicos)
+  - Monitoreo Satelital (Sentinel-2, ΔNDVI, ΔNBR) solo al presionar "Cargar"
+  - Dos mapas linkeados (swipe)
+  - Badges (arriba-derecha) y Leyenda (abajo-izquierda) solo cuando hay capas
+  - Herramienta de Medición incrustada en el sidebar (siempre disponible)
+
+=========================================================== ***/
+
+/* =================== Utilidad UI =================== */
+function divider(){ return ui.Panel([], null, {margin:'8px 0', border:'1px solid #ddd'}); }
+
+/* =================== Parámetros de procesamiento =================== */
+var UMBRAL_NUBES = 40;   // 0–100 (sugerido 30–50)
+var DILATACION   = 1;    // px dilatación de máscara
+var MAX_IMG_MES  = 20;   // cap de imágenes por mes
+
+// Magnitud de cambio (sobre |ΔNDVI| y |ΔNBR|)
+var UMBRAL_MOD = 0.20;
+var UMBRAL_MAX = 0.35;
+
+/* =================== Funciones auxiliares =================== */
+function rangoMensual(ym) {
+  var partes = ee.String(ym).split('-');
+  var anio = ee.Number.parse(partes.get(0));
+  var mes  = ee.Number.parse(partes.get(1));
+  var inicio = ee.Date.fromYMD(anio, mes, 1);
+  var fin    = inicio.advance(1, 'month');
+  return {start: inicio, end: fin};
+}
+
+var S2_SR    = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var S2_CPROB = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY');
+
+// Colección mensual con probabilidad de nubes + bandas mínimas
+function coleccionMes(ym, aoi) {
+  var r = rangoMensual(ym);
+
+  var sr = S2_SR
+    .filterBounds(aoi)
+    .filterDate(r.start, r.end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+    .select(['B2','B3','B4','B8','B8A','B12','SCL']);
+
+  var cp = S2_CPROB
+    .filterBounds(aoi)
+    .filterDate(r.start, r.end)
+    .select(['probability']);
+
+  var joined = ee.Join.saveFirst('clouds').apply({
+    primary: sr,
+    secondary: cp,
+    condition: ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+  });
+
+  var withProb = ee.ImageCollection(joined)
+    .filter(ee.Filter.notNull(['clouds']))
+    .map(function(img){
+      var prob = ee.Image(img.get('clouds')).rename('cloud_probability');
+      return ee.Image(img).addBands(prob);
+    })
+    .sort('cloud_probability')   // menos nubosas primero
+    .limit(MAX_IMG_MES);
+
+  return withProb;
+}
+
+function mascaraNubesSombras(img){
+  var nubes = img.select('cloud_probability').gt(UMBRAL_NUBES);
+  var scl = img.select('SCL');
+  // 3 sombra; 8 nube media; 9 nube densa; 10 cirros; 11 nieve/hielo
+  var sclNubes = scl.eq(3).or(scl.eq(8)).or(scl.eq(9)).or(scl.eq(10)).or(scl.eq(11));
+  var malo = nubes.or(sclNubes).focal_max(DILATACION);
+  return img.updateMask(malo.not());
+}
+
+// Mosaico mensual (mediana de <= MAX_IMG_MES) + metadatos
+function mosaicoMensual(ym, aoi) {
+  var col = coleccionMes(ym, aoi).map(mascaraNubesSombras);
+  var n   = col.size();
+
+  // Fecha representativa ~ mediana temporal
+  var idx = ee.Number(n).subtract(1).divide(2).floor();
+  var repMillis = ee.Algorithms.If(
+    n.gt(0),
+    ee.List(col.aggregate_array('system:time_start')).sort().get(idx),
+    rangoMensual(ym).start.millis()
+  );
+  var repDate = ee.Date(repMillis);
+
+  var comp = ee.Image(
+    ee.Algorithms.If(
+      n.gt(0),
+      col.median().clip(aoi),
+      ee.Image.constant([0,0,0,0,0,0])
+        .rename(['B2','B3','B4','B8','B8A','B12']).updateMask(ee.Image(0))
+    )
+  );
+
+  return comp.set({
+    'rep_date': repDate.millis(),
+    'label_ym': repDate.format('YYYY-MM'),
+    'count_imgs': n
+  });
+}
+
+function ndvi(img){ return img.normalizedDifference(['B8','B4']).rename('NDVI'); }
+function nbr(img){  return img.normalizedDifference(['B8','B12']).rename('NBR'); }
+
+/* =================== Estilos de visualización =================== */
+var visRGB   = {bands: ['B4','B3','B2'], min: 0, max: 3000, gamma: 1.1};
+var visSWIR  = {bands: ['B12','B8A','B4'], min: 0, max: 3500, gamma: 1.0};
+var visNDVI  = {min: -0.2, max: 0.9, palette: ['#440154','#3b528b','#21908d','#5dc962','#fde725']};
+var visDelta = {min: -0.5, max: 0.5, palette: ['#7f0000','#ffeda0','#00441b']};
+var visClase3= {min: 1, max: 2, palette: ['#e88320', '#ff000d']};
+
+/* =================== Herramienta de Medición (incrustada) =================== */
+function buildMeasurementPanel(targetMap) {
+  var dt = targetMap.drawingTools();
+  dt.setShown(false);
+
+  function ensureLayer(){
+    if (dt.layers().length() === 0){
+      var layer = ui.Map.GeometryLayer({geometries: [], name:'Medicion'});
+      dt.layers().add(layer);
+    }
+    dt.setDrawModes(['point','line','polygon','rectangle']);
+    dt.setShape(null);
+  }
+  ensureLayer();
+
+  function clearDrawings(){
+    if (dt.layers().length() === 0) return;
+    var lyr = dt.layers().get(0);
+    var geoms = lyr.geometries();
+    while (geoms.length() > 0) geoms.remove(geoms.get(0));
+  }
+
+  function getLastGeometry(){
+    if (dt.layers().length() === 0) return null;
+    var geoms = dt.layers().get(0).geometries();
+    if (geoms.length() === 0) return null;
+    var g = geoms.get(geoms.length() - 1);
+    if (g && typeof g.getEeGeometry === 'function') return g.getEeGeometry();
+    if (g && typeof g.getEeObject === 'function')   return g.getEeObject();
+    try { return ee.Geometry(g); } catch (e) { return null; }
+  }
+
+  var modeSelect = ui.Select({items:['LÍNEA','POLÍGONO'], value:'LÍNEA', style:{stretch:'horizontal'}});
+  var btnNuevo = ui.Button({
+    label:'➕ Nuevo dibujo', style:{stretch:'horizontal'},
+    onClick:function(){
+      clearDrawings();
+      dt.setShape(modeSelect.getValue()==='LÍNEA' ? 'line' : 'polygon');
+      dt.draw();
+    }
+  });
+  var btnCalcular = ui.Button({label:'🧮 Calcular ahora', style:{stretch:'horizontal'}, onClick:function(){ updateMetrics(); }});
+  var btnLimpiar = ui.Button({
+    label:'🗑️ Limpiar', style:{stretch:'horizontal', color:'white', backgroundColor:'#c23b22'},
+    onClick:function(){ clearDrawings(); setOutputs(null,null,null); }
+  });
+
+  var outLong  = ui.Label('Longitud: —');
+  var outPerim = ui.Label('Perímetro: —');
+  var outArea  = ui.Label('Área: —');
+
+  function setOutputs(L, P, A){
+    outLong.setValue(L && L > 0
+      ? 'Longitud: ' + L.toFixed(2) + ' m (' + (L/1000).toFixed(3) + ' km)'
+      : 'Longitud: —');
+    outPerim.setValue(P && P > 0
+      ? 'Perímetro: ' + P.toFixed(2) + ' m (' + (P/1000).toFixed(3) + ' km)'
+      : 'Perímetro: —');
+    outArea.setValue(A && A > 0
+      ? 'Área: ' + A.toFixed(2) + ' m² (' + (A/10000).toFixed(2) + ' ha, ' + (A/1e6).toFixed(4) + ' km²)'
+      : 'Área: —');
+  }
+
+  function updateMetrics(){
+    var geom = getLastGeometry();
+    if (!geom){ setOutputs(null,null,null); return; }
+    var g = ee.Geometry(geom, null, true); // geodésico
+
+    var metrics = ee.Dictionary({
+      lengthM: g.length(1, null),
+      perimM:  g.perimeter(1, null),
+      areaM2:  g.area(1, null)
+    });
+
+    metrics.evaluate(function(d){
+      if (!d){ setOutputs(null,null,null); return; }
+      var L = d.lengthM || 0, P = d.perimM || 0, A = d.areaM2 || 0;
+      if (A > 0){ setOutputs(null, P, A); }
+      else if (L > 0){ setOutputs(L, null, null); }
+      else { setOutputs(null,null,null); }
+    });
+  }
+
+  dt.onDraw(updateMetrics);
+  dt.onEdit(updateMetrics);
+
+  (function init(){
+    clearDrawings();
+    dt.setShape('line');
+    dt.draw();
+  })();
+
+  // Panel para incrustar en el sidebar
+  var panel = ui.Panel();
+  panel.add(ui.Label('Herramienta de Medición',{fontWeight:'bold'}));
+  panel.add(divider());
+  panel.add(modeSelect);
+  panel.add(btnNuevo);
+  panel.add(btnCalcular);
+  panel.add(btnLimpiar);
+  panel.add(divider());
+  panel.add(outLong);
+  panel.add(outPerim);
+  panel.add(outArea);
+
+  return panel;
+}
+
+/* =================== Render principal de la App =================== */
+function renderApp(params) {
+  var MES_A = params.mesA;
+  var MES_B = params.mesB;
+  var aoi   = params.aoi;
+  var zoom  = params.zoom || 12;
+  var loaded = !!params.loaded; // <-- si false: no carga capas ni centra
+
+  // Mapas linkeados (sin setOptions para evitar SATELLITE por defecto)
+  var mapaIzq = ui.Map();
+  var mapaDer = ui.Map();
+  ui.Map.Linker([mapaIzq, mapaDer]);
+
+  // Si loaded == true, centramos en el AOI; si no, dejamos el centro por defecto (más liviano)
+  if (loaded && aoi) {
+    mapaIzq.centerObject(aoi, zoom);
+    mapaDer.centerObject(aoi, zoom);
+  }
+
+  /* ====== Sidebar (parámetros + medición) ====== */
+  var sidebar = ui.Panel({style:{width:'320px', padding:'10px', backgroundColor:'white'}});
+  sidebar.add(ui.Label('Monitoreo Satelital — Detección de Cambio',{fontWeight:'bold', fontSize:'14px'}));
+  sidebar.add(ui.Label('Parámetros',{fontWeight:'bold', margin:'8px 0 4px 0'}));
+
+  var tbMesA   = ui.Textbox({placeholder:'YYYY-MM', value:MES_A});
+  var tbMesB   = ui.Textbox({placeholder:'YYYY-MM', value:MES_B});
+  var tbCoord  = ui.Textbox({placeholder:'lat, lon', value: params.coordText || ''}); // ej.: -16.48,-65.58
+  var tbBuffer = ui.Textbox({placeholder:'Buffer (m)', value: String(params.bufferMeters || '')});
+
+  function row(label, widget){
+    var p = ui.Panel({layout: ui.Panel.Layout.flow('vertical'), style:{margin:'4px 0'}});
+    p.add(ui.Label(label, {fontSize:'11px'}));
+    p.add(widget);
+    return p;
+  }
+  sidebar.add(row('Mes A (YYYY-MM)', tbMesA));
+  sidebar.add(row('Mes B (YYYY-MM)', tbMesB));
+  sidebar.add(row('Coordenadas (lat, lon)', tbCoord));
+  sidebar.add(row('Buffer (m)', tbBuffer));
+
+  var lblError = ui.Label('', {color:'red', fontSize:'11px', margin:'4px 0 0 0'});
+  sidebar.add(lblError);
+
+  // El botón ahora se llama "Cargar" si no hay capas, y "Actualizar" si ya cargaste
+  var btnAct = ui.Button({
+    label: loaded ? 'Actualizar' : 'Cargar',
+    style:{stretch:'horizontal', margin:'8px 0 0 0'}
+  });
+  sidebar.add(btnAct);
+
+  // Medición integrada (opera sobre el mapa derecho)
+  sidebar.add(divider());
+  sidebar.add(buildMeasurementPanel(mapaDer));
+
+  // Split de mapas y layout principal
+  var splitMaps = ui.SplitPanel({firstPanel:mapaIzq, secondPanel:mapaDer, orientation:'horizontal', wipe:true});
+  var mapsPanel = ui.Panel([splitMaps], null, {stretch:'both'});
+  var outer = ui.SplitPanel({firstPanel:sidebar, secondPanel:mapsPanel, orientation:'horizontal', wipe:false});
+
+  // Montamos layout
+  ui.root.widgets().reset([outer]);
+
+  // Acción del botón (carga bajo demanda)
+  function esMesValido(s){ return /^\d{4}\-(0[1-9]|1[0-2])$/.test(String(s||'')); }
+  btnAct.onClick(function(){
+    lblError.setValue('');
+    var mA = String(tbMesA.getValue() || '').trim();
+    var mB = String(tbMesB.getValue() || '').trim();
+    if(!esMesValido(mA) || !esMesValido(mB)){
+      lblError.setValue('Formato de mes inválido. Use YYYY-MM (ej.: 2025-02).');
+      return;
+    }
+    var coordStr = String(tbCoord.getValue() || '').trim();
+    var parts = coordStr.split(',');
+    if(parts.length < 2){
+      lblError.setValue('Coord. inválidas. Use "lat, lon".');
+      return;
+    }
+    var lat = parseFloat(parts[0]);
+    var lon = parseFloat(parts[1]);
+    if(isNaN(lat) || isNaN(lon)){
+      lblError.setValue('Coord. inválidas. No se pueden convertir a números.');
+      return;
+    }
+    var buff = parseInt(String(tbBuffer.getValue()||'').trim(), 10);
+    if(isNaN(buff) || buff <= 0){
+      lblError.setValue('Buffer inválido. Ingrese metros (>0).');
+      return;
+    }
+    var nuevoAOI = ee.Geometry.Point([lon, lat]).buffer(buff);
+
+    // Relanzamos la app en modo "loaded" para cargar capas recién aquí
+    renderApp({
+      mesA: mA,
+      mesB: mB,
+      aoi: nuevoAOI,
+      bufferMeters: buff,
+      coordText: lat.toFixed(6) + ',' + lon.toFixed(6),
+      zoom: zoom,
+      loaded: true
+    });
+  });
+
+  // Si aún no está loaded, no cargamos nada más (mantener liviano)
+  if (!loaded) {
+    // Opcional: un mensajito en cada mapa
+    var hintStyle = {position:'top-right', padding:'6px', backgroundColor:'rgba(255,255,255,0.9)'};
+    mapaIzq.add(ui.Panel([ui.Label('Sin capas aún.\nComplete parámetros y presione "Cargar".')], null, hintStyle));
+    mapaDer.add(ui.Panel([ui.Label('Sin capas aún.\nComplete parámetros y presione "Cargar".')], null, hintStyle));
+    return;
+  }
+
+  // ------------- SOLO CUANDO loaded == true -------------
+  // Mosaicos e índices
+  var imgA = mosaicoMensual(MES_A, aoi);
+  var imgB = mosaicoMensual(MES_B, aoi);
+
+  var ndviA = ndvi(imgA), ndviB = ndvi(imgB);
+  var nbrA  = nbr(imgA),  nbrB  = nbr(imgB);
+
+  var dNDVI = ndviB.subtract(ndviA).rename('dNDVI');
+  var dNBR  = nbrB.subtract(nbrA).rename('dNBR');
+  var absDelta = dNDVI.abs().max(dNBR.abs()).rename('absDelta');
+  var clase3 = ee.Image(0).where(absDelta.gte(UMBRAL_MOD), 1).where(absDelta.gte(UMBRAL_MAX), 2);
+  var clase3Viz = clase3.updateMask(clase3.gt(0)).clip(aoi);
+
+  // Centrar ahora que sí hay AOI y capas
+  mapaIzq.centerObject(aoi, zoom);
+  mapaDer.centerObject(aoi, zoom);
+
+  // Capas
+  mapaIzq.addLayer(imgA, visRGB,  'Mes A — RGB', true);
+  mapaDer.addLayer(imgB, visRGB,  'Mes B — RGB', true);
+  mapaIzq.addLayer(imgA, visSWIR, 'Mes A — SWIR', false);
+  mapaDer.addLayer(imgB, visSWIR, 'Mes B — SWIR', false);
+  mapaIzq.addLayer(ndviA, visNDVI,'Mes A — NDVI', false);
+  mapaDer.addLayer(ndviB, visNDVI,'Mes B — NDVI', false);
+  mapaIzq.addLayer(dNDVI, visDelta,'ΔNDVI', false);
+  mapaDer.addLayer(dNBR, visDelta, 'ΔNBR', false);
+  mapaIzq.addLayer(clase3Viz, visClase3, 'Cambio (naranja/rojo)', true);
+  mapaDer.addLayer(clase3Viz, visClase3, 'Cambio (naranja/rojo)', true);
+
+  // Badges de fecha (arriba-derecha)
+  function dateBadge(titulo, ymFallback, mosaicImg) {
+    var pnl = ui.Panel({
+      style:{
+        position:'top-right',
+        padding:'6px',
+        backgroundColor:'rgba(255,255,255,0.92)'
+      }
+    });
+    pnl.add(ui.Label(titulo, {fontWeight:'bold', fontSize:'12px'}));
+    var lblMes   = ui.Label('Mes: …',   {fontSize:'11px'});
+    var lblDate  = ui.Label('Fecha: …', {fontSize:'11px'});
+    var lblN     = ui.Label('Imgs: …',  {fontSize:'11px'});
+    pnl.add(lblMes); pnl.add(lblDate); pnl.add(lblN);
+
+    ee.Dictionary({
+      ym: ee.String(mosaicImg.get('label_ym')),
+      rep: ee.Number(mosaicImg.get('rep_date')),
+      n: ee.Number(mosaicImg.get('count_imgs'))
+    }).evaluate(function(o){
+      o = o || {};
+      var ym = o.ym || ymFallback;
+      var repStr = o.rep ? ee.Date(o.rep).format('YYYY-MM-dd').getInfo() : '—';
+      var n = (o.n !== undefined) ? o.n : '—';
+      lblMes.setValue('Mes: ' + ym);
+      lblDate.setValue('Fecha representativa: ' + repStr);
+      lblN.setValue('Imágenes usadas: ' + n);
+    });
+    return pnl;
+  }
+  mapaIzq.add(dateBadge('Izquierda (Mes A)', MES_A, imgA));
+  mapaDer.add(dateBadge('Derecha (Mes B)',  MES_B, imgB));
+
+  // Leyenda desplegable (abajo-izquierda)
+  function buildLegendPanel() {
+    var panel = ui.Panel({
+      style: {
+        position: 'bottom-left',
+        padding: '8px',
+        width: '260px',
+        backgroundColor: 'rgba(255,255,255,0.92)'
+      }
+    });
+
+    var btn = ui.Button({
+      label: '▼ Leyenda de cambio',
+      style: {stretch: 'horizontal', fontWeight:'bold', margin:'0 0 6px 0'}
+    });
+
+    var content = ui.Panel();
+    var cajaTransp = ui.Panel(null, null, {
+      width:'18px', height:'18px', border:'1px solid #999',
+      backgroundColor:'rgba(0,0,0,0)', margin:'0 8px 0 0'
+    });
+    var filaTransp = ui.Panel(
+      [cajaTransp, ui.Label('Sin cambios (transparente)')],
+      ui.Panel.Layout.flow('horizontal'),
+      {margin:'2px 0'}
+    );
+    function fila(color, texto){
+      var sw = ui.Label('', {backgroundColor: color, padding:'8px', margin:'0 8px 0 0'});
+      var lb = ui.Label(texto);
+      return ui.Panel([sw, lb], ui.Panel.Layout.flow('horizontal'), {margin:'2px 0'});
+    }
+    content.add(filaTransp);
+    content.add(fila('#e88320', 'Cambio moderado'));
+    content.add(fila('#ff000d', 'Alerta máxima'));
+
+    var visible = true;
+    btn.onClick(function(){
+      visible = !visible;
+      content.style().set('shown', visible);
+      btn.setLabel((visible ? '▼ ' : '► ') + 'Leyenda de cambio');
+    });
+
+    panel.add(btn);
+    panel.add(content);
+    return panel;
+  }
+  mapaIzq.add(buildLegendPanel());
+  mapaDer.add(buildLegendPanel());
+}
+
+/* =================== Arranque por defecto (sin cargar) =================== */
+// Sin centrar, sin mosaicos; el usuario ingresa parámetros y presiona "Cargar"
+renderApp({
+  mesA:'2025-02',
+  mesB:'2025-07',
+  aoi: null,              // <-- no AOI al inicio
+  bufferMeters: null,     // <-- sin buffer
+  coordText:'',           // <-- sin coords
+  zoom: 12,
+  loaded: false           // <-- arranque liviano
+});
